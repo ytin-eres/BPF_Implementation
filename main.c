@@ -213,8 +213,6 @@ static unsigned long get_leak_index_from_bruteforce(int prog_map)
 	return 0;
 }
 
-
-
 struct mem_leaker_prog load_mem_leaker_prog() {
   struct mem_leaker_prog ret;
 
