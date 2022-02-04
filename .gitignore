@@ -8,3 +8,11 @@
 /peda-session-7171.txt
 /peda-session-7667.txt
 /peda-session-unknown.txt
+Makefile
+peda-session-test.txt
+main.o
+Makefile
+test
+test.c
+Makefile
+.gdb_history

